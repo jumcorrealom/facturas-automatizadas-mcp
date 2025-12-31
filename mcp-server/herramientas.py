@@ -40,31 +40,36 @@ def generar_con_reintento(model, contents):
                 raise e
     raise Exception("Servidor saturado: No se pudo procesar tras varios reintentos.")
 
+
 @mcp.tool()
-def analizar_factura_pdf(nombre_archivo: str) -> str:
-    """Descarga un PDF y extrae datos JSON."""
+def analizar_factura_pdf(nombre_archivo: str, instrucciones: str) -> str:
+    """
+    Descarga un PDF y lo procesa con IA usando las instrucciones enviadas por el cliente.
+    """
     try:
         blob = bucket.blob(nombre_archivo)
-        if not blob.exists(): 
-            return "Error: Archivo no encontrado."
+        if not blob.exists():
+            return "Error: Archivo no encontrado en el bucket."
         
         pdf_bytes = blob.download_as_bytes()
         
-        prompt = """Extrae en JSON estricto: proveedor, fecha, numero_factura, total, items.
-        Sin markdown, solo texto plano JSON."""
+        # Instancia local del cliente para este proceso
+        client_genai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         
-        response = generar_con_reintento(
-            model=MODELO_ID,
+        # LLAMADA PURA: PDF + Instrucciones dinámicas
+        response = client_genai.models.generate_content(
+            model="gemini-flash-latest",
             contents=[
                 types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-                prompt
+                instrucciones # <--- Aquí entra el prompt que viaja desde el cliente
             ]
         )
         
+        # Limpieza básica para asegurar que llegue JSON limpio al orquestador
         return response.text.strip().replace("```json", "").replace("```", "")
 
     except Exception as e:
-        return f"Error procesando: {str(e)}"
+        return f"Error crítico al analizar PDF: {str(e)}"
 
 @mcp.tool()
 def enviar_datos_api(datos_json: str) -> str:
