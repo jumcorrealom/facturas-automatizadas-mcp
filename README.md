@@ -20,15 +20,24 @@ El sistema se divide en cuatro módulos principales:
 * API Key de Google Gemini.
 * Contraseña de aplicación de Gmail (para acceso IMAP).
 
+### 🔐 Cómo obtener la Contraseña de Aplicación de Gmail
+Para que el script pueda leer tus correos, no debes usar tu contraseña normal, sino una específica:
+1. Ve a tu [Cuenta de Google](https://myaccount.google.com/) > **Seguridad**.
+2. Asegúrate de tener activada la **Verificación en 2 pasos**.
+3. En la barra de búsqueda de la cuenta (lupa), escribe **"Contraseñas de aplicaciones"**.
+4. Crea una nueva: ponle de nombre "Facturas Python" y dale a "Crear".
+5. Copia el código de 16 letras que te dan (sin espacios); esa será tu variable `PASSWORD`.
+
 ## ⚙️ Configuración e Instalación
 
 ### 1. Clonar el repositorio y configurar variables de entorno
 
-Crea un archivo `.env` en la raíz del proyecto con las siguientes credenciales (asegúrate de no subirlo al repositorio):
+Crea un archivo `.env` en la raíz del proyecto con las siguientes credenciales.
+**IMPORTANTE:** Nunca subas este archivo a GitHub.
 
 ```env
 CORREO=tu_correo@gmail.com
-PASSWORD=tu_contraseña_de_aplicacion
+PASSWORD=tu_contraseña_de_aplicacion_de_16_letras
 GEMINI_API_KEY=tu_api_key_de_gemini
 ```
 
