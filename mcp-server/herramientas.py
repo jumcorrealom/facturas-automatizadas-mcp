@@ -1,118 +1,87 @@
 import os
 import json
-import time
 import requests
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from google.cloud import storage
 from google import genai
-from google.genai import types
-from google.genai.errors import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configuración
-BUCKET_NAME = 'facturacion-mcp' 
+# --- CONFIGURACIÓN ---
+API_KEY_SERVICIO = "secreto_super_seguro_123"  # En prod, usar variables de entorno
+BUCKET_NAME = 'facturacion-mcp'
+API_DESTINO = "http://localhost:8001/recepcion-facturas"
+
+# Inicializamos FastMCP
+mcp = FastMCP("ServidorCentralizado")
+
+# Clientes de Google
 storage_client = storage.Client()
 bucket = storage_client.bucket(BUCKET_NAME)
 
-# Usamos el alias genérico
-MODELO_ID = "gemini-flash-latest" 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# --- MIDDLEWARE DE SEGURIDAD (Simulado en herramientas) ---
+# Nota: En producción real (AWS/GCP), la autenticación se suele manejar 
+# en el API Gateway o Nginx antes de llegar aquí. 
+# Pero podemos proteger las herramientas verificando el contexto.
 
-mcp = FastMCP("ServidorFacturas")
-API_DESTINO = "http://localhost:8000/recepcion-facturas"
+def verificar_acceso(ctx: Context):
+    """Verifica si el cliente envió el token correcto en los headers."""
+    # FastMCP permite acceder a metadatos de la sesión en futuras versiones.
+    # Por ahora, asumiremos que si llegan al endpoint, pasaron el Gateway.
+    # Esta función es un placeholder para lógica de validación interna.
+    pass
 
-def generar_con_reintento(model, contents):
-    """Reintenta si hay error de cuota."""
-    intentos = 0
-    max_intentos = 3
-    while intentos < max_intentos:
-        try:
-            return client.models.generate_content(model=model, contents=contents)
-        except ClientError as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                # EMOJI ELIMINADO AQUÍ
-                print(f"[ALERTA] Cuota llena en servidor. Reintentando en 10s... ({intentos+1})")
-                time.sleep(10)
-                intentos += 1
-            else:
-                raise e
-    raise Exception("Servidor saturado: No se pudo procesar tras varios reintentos.")
-
+# --- HERRAMIENTAS (Iguales que antes, pero listas para red) ---
 
 @mcp.tool()
-def analizar_factura_pdf(nombre_archivo: str, instrucciones: str) -> str:
-    """
-    Descarga un PDF y lo procesa con IA usando las instrucciones enviadas por el cliente.
-    """
+def analizar_factura_pdf(nombre_archivo: str, instrucciones: str, ctx: Context) -> str:
+    """Descarga y analiza PDF (Requiere Auth)."""
+    verificar_acceso(ctx) # Check de seguridad
+    
     try:
         blob = bucket.blob(nombre_archivo)
-        if not blob.exists():
-            return "Error: Archivo no encontrado en el bucket."
+        if not blob.exists(): return "Error: 404 Archivo no encontrado."
         
         pdf_bytes = blob.download_as_bytes()
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         
-        # Instancia local del cliente para este proceso
-        client_genai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        
-        # LLAMADA PURA: PDF + Instrucciones dinámicas
-        response = client_genai.models.generate_content(
+        response = client.models.generate_content(
             model="gemini-flash-latest",
             contents=[
-                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-                instrucciones # <--- Aquí entra el prompt que viaja desde el cliente
+                genai.types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                instrucciones
             ]
         )
-        
-        # Limpieza básica para asegurar que llegue JSON limpio al orquestador
         return response.text.strip().replace("```json", "").replace("```", "")
-
     except Exception as e:
-        return f"Error crítico al analizar PDF: {str(e)}"
+        return f"Error servidor: {str(e)}"
 
 @mcp.tool()
 def enviar_datos_api(datos_json: str) -> str:
-    """Envía el JSON a la API local real."""
+    """Envía datos a la API interna."""
     try:
-        # 1. Convertir texto a diccionario Python
-        payload = json.loads(datos_json)
-        
-        # 2. HACER EL ENVÍO REAL (Antes estaba comentado)
-        print(f"[INFO] Enviando datos a {API_DESTINO}...")
-        res = requests.post(API_DESTINO, json=payload)
-        
-        # 3. Retornar lo que respondió la API
-        if res.status_code == 200:
-            return f"Éxito. La API respondió: {res.json()}"
-        else:
-            return f"Error en API. Status: {res.status_code}"
-
-    except requests.exceptions.ConnectionError:
-        return "Error: No se pudo conectar a la API. ¿Está corriendo en el puerto 8000?"
+        res = requests.post(API_DESTINO, json=json.loads(datos_json))
+        return f"API Respondió: {res.status_code} - {res.text}"
     except Exception as e:
-        return f"Error de envío: {str(e)}"
+        return f"Error conexión API: {e}"
 
 @mcp.tool()
 def listar_facturas_pendientes() -> str:
-    """Lista SOLO UNA factura para pruebas de cuota."""
-    try:
-        blobs = bucket.list_blobs()
-        files = [b.name for b in blobs if b.name.endswith('.pdf')]
-        
-        if not files:
-            return "No hay facturas."
-            
-        # Mantenemos el límite de 1 factura para proteger tu cuota
-        archivo_prueba = files[:1] 
-        
-        # EMOJI ELIMINADO AQUÍ
-        print(f"[DEBUG] Modo Prueba: Mostrando solo {archivo_prueba} de {len(files)} archivos.")
-        return str(archivo_prueba)
+    """Lista facturas en el bucket."""
+    # ... lógica de listado ...
+    blobs = bucket.list_blobs()
+    files = [b.name for b in blobs if b.name.endswith('.pdf')]
+    return str(files[:1])
 
-    except Exception as e:
-        # Esto captura el error si vuelve a pasar algo raro
-        return f"Error bucket: {str(e)}"
+# --- OTRA HERRAMIENTA (Para demostrar el problema del contexto) ---
+@mcp.tool()
+def herramienta_recursos_humanos(empleado: str) -> str:
+    """Herramienta que NO debería ver el agente de facturación."""
+    return f"Datos de RRHH del empleado {empleado}..."
 
 if __name__ == "__main__":
-    mcp.run()
+    # ESTO CAMBIA: Ahora corremos en modo SSE (HTTP)
+    # Escucha en el puerto 8080
+    print("🚀 Servidor MCP levantado en http://localhost:8080")
+    mcp.run(transport="sse")

@@ -6,9 +6,12 @@ from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 
 load_dotenv()
+
+SERVER_URL = "http://localhost:8000/sse"
+AUTH_HEADERS = {"Authorization": "Bearer secreto_super_seguro_123"}
 
 MODEL_ID = "gemini-flash-latest"
 
@@ -57,100 +60,124 @@ tool_listar = types.FunctionDeclaration(
 )
 
 mcp_tools = [tool_analizar, tool_enviar, tool_listar]
-
+# --- 3. LISTA BLANCA (WHITELIST) DE HERRAMIENTAS ---
+# Aquí es donde evitas que el agente "se vuelva loco".
+# Definimos explícitamente qué herramientas tiene permitido usar este agente.
+HERRAMIENTAS_PERMITIDAS = {
+    "analizar_factura_pdf",
+    "enviar_datos_api",
+    "listar_facturas_pendientes"
+}
+# Nota: "herramienta_recursos_humanos" NO está en la lista.
 async def main():
-    server_params = StdioServerParameters(
-        command="python",
-        args=["mcp-server/herramientas.py"], 
-        env=os.environ.copy()
-    )
+    print(f"🌐 Conectando al servidor remoto: {SERVER_URL}...")
 
-    print("🔌 Iniciando Agente Autónomo de Facturación...")
-
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            
-            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            
-            # Instrucción del sistema para autonomía total
-            system_instruction = f"""
-            Eres un agente autónomo de facturación. Tu trabajo es:
-            1. Listar facturas pendientes.
-            2. Si hay archivos, analízalos uno por uno usando SIEMPRE estas instrucciones en el parámetro 'instrucciones': '{PROMPT_CONTABILIDAD}'.
-            3. Envía el resultado a la API.
-            4. Informa el resultado final.
-            
-            No preguntes al usuario. Actúa directamente.
-            """
-
-            chat = client.chats.create(
-                model=MODEL_ID,
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(function_declarations=mcp_tools)],
-                    system_instruction=system_instruction
-                )
-            )
-
-            print("🤖 Agente iniciado. Ejecutando flujo de trabajo...")
-            
-            # --- DISPARADOR AUTOMÁTICO ---
-            mensaje_inicial = "Inicia el proceso de revisión y procesamiento de facturas ahora."
-            
-            # Lógica de reintento simple para la primera llamada
-            try:
-                response = chat.send_message(mensaje_inicial)
-            except ClientError as e:
-                print(f"⚠️ Error inicial (posible cuota): {e}")
-                return
-
-            # --- BUCLE DE RESOLUCIÓN DE HERRAMIENTAS ---
-            # Este bucle sigue corriendo mientras el modelo pida usar herramientas
-            while True:
-                function_calls = []
-                if response.candidates and response.candidates[0].content.parts:
-                    for part in response.candidates[0].content.parts:
-                        if part.function_call:
-                            function_calls.append(part.function_call)
+    try:
+        async with sse_client(SERVER_URL, headers=AUTH_HEADERS) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
                 
-                # Si no hay llamadas a herramientas, el trabajo terminó
-                if not function_calls:
-                    print("\n✅ TAREA COMPLETADA.")
-                    print(f"Reporte final: {response.text}")
-                    break
-
-                # Ejecutar herramientas solicitadas
-                parts_response = []
-                for call in function_calls:
-                    print(f"⚡ Ejecutando autónomamente: {call.name}...")
-                    
-                    # Llamada al servidor MCP
-                    result_mcp = await session.call_tool(call.name, arguments=dict(call.args))
-                    tool_output = result_mcp.content[0].text
-                    
-                    print(f"   ↳ Resultado: {tool_output[:100]}...") # Log corto
-                    
-                    parts_response.append(
-                        types.Part.from_function_response(
-                            name=call.name,
-                            response={"result": tool_output}
+                # --- A) OBTENER Y FILTRAR HERRAMIENTAS ---
+                list_tools_result = await session.list_tools()
+                mis_tools_gemini = []
+                
+                for tool in list_tools_result.tools:
+                    if tool.name in HERRAMIENTAS_PERMITIDAS:
+                        print(f"✅ Cargando herramienta: {tool.name}")
+                        declaracion = types.FunctionDeclaration(
+                            name=tool.name,
+                            description=tool.description,
+                            parameters=tool.inputSchema
                         )
-                    )
-
-                # Pausa para respetar cuotas (Rate Limiting)
-                time.sleep(2)
-
-                # Devolver resultados al modelo para que decida el siguiente paso
-                try:
-                    response = chat.send_message(parts_response)
-                except ClientError as e:
-                    if "429" in str(e):
-                        print("⏳ Cuota llena. Pausando 15s antes de continuar...")
-                        time.sleep(15)
-                        response = chat.send_message(parts_response)
+                        mis_tools_gemini.append(declaracion)
                     else:
-                        print(f"❌ Error fatal en el bucle: {e}")
+                        print(f"🚫 Ignorando herramienta irrelevante: {tool.name}")
+
+                # --- B) INICIAR EL CEREBRO (GEMINI) ---
+                client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+                
+                sys_instr = f"""
+                Eres un agente autónomo de facturación.
+                Tu objetivo es procesar todas las facturas pendientes.
+                
+                REGLA DE ORO:
+                Cuando uses la herramienta 'analizar_factura_pdf', DEBES poner en el parámetro 
+                'instrucciones' exáctamente este texto: '{PROMPT_CONTABILIDAD}'
+                """
+
+                chat = client.chats.create(
+                    model="gemini-flash-latest",
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(function_declarations=mis_tools_gemini)],
+                        system_instruction=sys_instr
+                    )
+                )
+
+                print("🤖 Agente Remoto Iniciado. Ejecutando flujo de trabajo...")
+                
+                # Disparamos la primera acción
+                response = chat.send_message("Empieza a procesar las facturas pendientes ahora.")
+
+                # --- C) BUCLE DE EJECUCIÓN AUTÓNOMA ---
+                while True:
+                    # 1. Detectar si Gemini quiere llamar herramientas
+                    function_calls = []
+                    if response.candidates and response.candidates[0].content.parts:
+                        for part in response.candidates[0].content.parts:
+                            if part.function_call:
+                                function_calls.append(part.function_call)
+                    
+                    # 2. Si no hay llamadas, terminamos
+                    if not function_calls:
+                        print("\n✅ TAREA COMPLETADA.")
+                        print(f"Reporte final: {response.text}")
                         break
+
+                    # 3. Ejecutar las herramientas solicitadas
+                    parts_response = []
+                    for call in function_calls:
+                        print(f"⚡ Ejecutando remotamente: {call.name}...")
+                        
+                        try:
+                            # AQUÍ OCURRE LA MAGIA: El cliente llama al servidor HTTP por ti
+                            result_mcp = await session.call_tool(call.name, arguments=dict(call.args))
+                            
+                            # Extraemos el texto del resultado
+                            tool_output = result_mcp.content[0].text
+                            print(f"   ↳ Servidor respondió: {tool_output[:100]}...")
+                            
+                            parts_response.append(
+                                types.Part.from_function_response(
+                                    name=call.name,
+                                    response={"result": tool_output}
+                                )
+                            )
+                        except Exception as e:
+                            print(f"❌ Error ejecutando herramienta {call.name}: {e}")
+                            parts_response.append(
+                                types.Part.from_function_response(
+                                    name=call.name,
+                                    response={"error": str(e)}
+                                )
+                            )
+
+                    # 4. Pausa táctica (evitar saturar la API)
+                    time.sleep(2)
+
+                    # 5. Devolver resultados a Gemini para que decida el siguiente paso
+                    try:
+                        response = chat.send_message(parts_response)
+                    except ClientError as e:
+                        if "429" in str(e):
+                            print("⏳ Cuota llena. Esperando 15s...")
+                            time.sleep(15)
+                            response = chat.send_message(parts_response)
+                        else:
+                            raise e
+
+    except Exception as e:
+        print(f"\n❌ Error de conexión o ejecución: {e}")
+        print("Asegúrate de que 'python mcp-server/herramientas.py' esté corriendo en otra terminal.")
 
 if __name__ == "__main__":
     asyncio.run(main())
